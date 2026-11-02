@@ -18,6 +18,7 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <sys/timerfd.h>
 #include <poll.h>
 
@@ -204,6 +205,85 @@ void spawn_initial_pool(void) {
     }
 }
 
+static void reap_children(void) {
+    int status = 0;
+    pid_t pid;
+    while ((pid = waitpid(-1, &status, WNOHANG)) > 0) {
+        child_record_t *rec = childtab_find_by_pid(pid);
+        if (rec == NULL) {
+            log_msg(LOG_LEVEL_WARN, "Reaped untracked child process PID:%d", (int)pid);
+            continue;
+        }
+
+        childtab_record_exit(pid, status);
+
+        if (WIFEXITED(status)) {
+            log_msg(LOG_LEVEL_INFO, "Worker [slot:%zu, PID:%d] exited with code %d",
+                    rec->slot_index, (int)pid, WEXITSTATUS(status));
+        } else if (WIFSIGNALED(status)) {
+            log_msg(LOG_LEVEL_WARN, "Worker [slot:%zu, PID:%d] terminated by signal %d (%s)",
+                    rec->slot_index, (int)pid, WTERMSIG(status), strsignal(WTERMSIG(status)));
+        }
+
+        if (s_heartbeats != NULL && rec->slot_index < MAX_WORKERS) {
+            s_heartbeats[rec->slot_index].active = 0;
+        }
+
+        if (s_state == STATE_RUNNING) {
+            struct timespec ts;
+            clock_gettime(CLOCK_MONOTONIC, &ts);
+            uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+
+            if (childtab_record_restart(rec->slot_index, now_ms, s_config.max_restarts) == 0) {
+                log_msg(LOG_LEVEL_INFO, "Worker [slot:%zu] restart %d/%d scheduled in %lums",
+                        rec->slot_index, rec->restart_count, s_config.max_restarts,
+                        (unsigned long)rec->backoff_delay_ms);
+                if (rec->backoff_delay_ms <= 100) {
+                    spawn_worker(rec->slot_index);
+                }
+            } else {
+                log_msg(LOG_LEVEL_ERROR, "Worker [slot:%zu] exceeded max restarts (%d), marked FAILED",
+                        rec->slot_index, s_config.max_restarts);
+            }
+        } else if (s_state == STATE_DRAINING) {
+            log_msg(LOG_LEVEL_INFO, "Worker [slot:%zu, PID:%d] reaped during DRAINING (%zu active remaining)",
+                    rec->slot_index, (int)pid, childtab_active_count());
+            if (childtab_active_count() == 0) {
+                log_msg(LOG_LEVEL_INFO, "All workers reaped, entering TERMINATED");
+                transition(STATE_TERMINATED, "all workers reaped");
+            }
+        }
+
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+        statefile_write_status(STATUS_FILE_DEFAULT, s_state,
+                               childtab_capacity(), childtab_get(0),
+                               s_heartbeats, now_ms);
+    }
+}
+
+static void handle_timer_tick(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+
+    /* Check any pending restarts under exponential backoff */
+    if (s_state == STATE_RUNNING) {
+        size_t cap = childtab_capacity();
+        for (size_t i = 0; i < cap; i++) {
+            child_record_t *rec = childtab_get(i);
+            if (rec != NULL && rec->state == WORKER_STATE_DEAD) {
+                if (rec->next_retry_mono_ms > 0 && now_ms >= rec->next_retry_mono_ms) {
+                    rec->next_retry_mono_ms = 0;
+                    log_msg(LOG_LEVEL_INFO, "Spawning delayed restart for worker [slot:%zu]", i);
+                    spawn_worker(i);
+                }
+            }
+        }
+    }
+}
+
 static void handle_dispatched_signal(uint8_t sigcode) {
     switch (sigcode) {
         case SIGCODE_INT:
@@ -228,7 +308,7 @@ static void handle_dispatched_signal(uint8_t sigcode) {
             log_msg(LOG_LEVEL_INFO, "Supervisor received SIGHUP, reload flag set");
             break;
         case SIGCODE_CHLD:
-            log_msg(LOG_LEVEL_DEBUG, "Supervisor received SIGCHLD");
+            reap_children();
             break;
         case SIGCODE_USR1:
             log_msg(LOG_LEVEL_INFO, "Supervisor status dump (SIGUSR1): State=%s, Active Workers=%zu",
@@ -282,6 +362,7 @@ static void run_event_loop(void) {
             uint64_t exp = 0;
             ssize_t r = read(s_timer_fd, &exp, sizeof(exp));
             (void)r;
+            handle_timer_tick();
         }
 
         if (s_state == STATE_TERMINATED) {
