@@ -29,6 +29,66 @@ static int s_fifo_fd = -1;
 static int s_timer_fd = -1;
 static char s_shm_name[64] = {0};
 static worker_heartbeat_t *s_heartbeats = NULL;
+static int s_running_loop = 1;
+
+static void sup_sig_handler(int sig) {
+    uint8_t code = 0;
+    switch (sig) {
+        case SIGINT:  code = SIGCODE_INT;  break;
+        case SIGTERM: code = SIGCODE_TERM; break;
+        case SIGHUP:  code = SIGCODE_HUP;  break;
+        case SIGCHLD: code = SIGCODE_CHLD; break;
+        case SIGTSTP: code = SIGCODE_TSTP; break;
+        case SIGCONT: code = SIGCODE_CONT; break;
+        case SIGUSR1: code = SIGCODE_USR1; break;
+        case SIGUSR2: code = SIGCODE_USR2; break;
+        default: return;
+    }
+    selfpipe_write_signal(code);
+}
+
+static int setup_supervisor_signals(void) {
+    sigreg_install(SIGINT, sup_sig_handler, SA_RESTART, NULL);
+    sigreg_install(SIGTERM, sup_sig_handler, SA_RESTART, NULL);
+    sigreg_install(SIGHUP, sup_sig_handler, SA_RESTART, NULL);
+    sigreg_install(SIGCHLD, sup_sig_handler, SA_RESTART | SA_NOCLDSTOP, NULL);
+    sigreg_install(SIGTSTP, sup_sig_handler, SA_RESTART, NULL);
+    sigreg_install(SIGCONT, sup_sig_handler, SA_RESTART, NULL);
+    sigreg_install(SIGUSR1, sup_sig_handler, SA_RESTART, NULL);
+    sigreg_install(SIGUSR2, sup_sig_handler, SA_RESTART, NULL);
+    sigreg_ignore(SIGPIPE);
+    return 0;
+}
+
+static int setup_ipc_and_timers(void) {
+    unlink(FIFO_FILE_DEFAULT);
+    if (mkfifo(FIFO_FILE_DEFAULT, 0666) < 0) {
+        log_msg(LOG_LEVEL_ERROR, "mkfifo %s failed: %s", FIFO_FILE_DEFAULT, strerror(errno));
+        return -1;
+    }
+    s_fifo_fd = open(FIFO_FILE_DEFAULT, O_RDWR | O_NONBLOCK);
+    if (s_fifo_fd < 0) {
+        log_msg(LOG_LEVEL_ERROR, "open FIFO %s failed: %s", FIFO_FILE_DEFAULT, strerror(errno));
+        return -1;
+    }
+
+    s_timer_fd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (s_timer_fd < 0) {
+        log_msg(LOG_LEVEL_ERROR, "timerfd_create failed: %s", strerror(errno));
+        return -1;
+    }
+
+    struct itimerspec its;
+    memset(&its, 0, sizeof(its));
+    its.it_interval.tv_sec = 1;
+    its.it_value.tv_sec = 1;
+    if (timerfd_settime(s_timer_fd, 0, &its, NULL) < 0) {
+        log_msg(LOG_LEVEL_ERROR, "timerfd_settime failed: %s", strerror(errno));
+        return -1;
+    }
+
+    return 0;
+}
 
 static void cleanup_resources(void) {
     if (s_fifo_fd >= 0) {
@@ -144,6 +204,92 @@ void spawn_initial_pool(void) {
     }
 }
 
+static void handle_dispatched_signal(uint8_t sigcode) {
+    switch (sigcode) {
+        case SIGCODE_INT:
+        case SIGCODE_TERM:
+            log_msg(LOG_LEVEL_INFO, "Supervisor received %s, initiating graceful shutdown",
+                    sigcode == SIGCODE_INT ? "SIGINT" : "SIGTERM");
+            transition(STATE_DRAINING, "termination signal received");
+            break;
+        case SIGCODE_TSTP:
+            if (s_state != STATE_DRAINING) {
+                log_msg(LOG_LEVEL_INFO, "Supervisor received SIGTSTP, suspending pool");
+                transition(STATE_SUSPENDED, "SIGTSTP received");
+            }
+            break;
+        case SIGCODE_CONT:
+            if (s_state == STATE_SUSPENDED) {
+                log_msg(LOG_LEVEL_INFO, "Supervisor received SIGCONT, resuming pool");
+                transition(STATE_RUNNING, "SIGCONT received");
+            }
+            break;
+        case SIGCODE_HUP:
+            log_msg(LOG_LEVEL_INFO, "Supervisor received SIGHUP, reload flag set");
+            break;
+        case SIGCODE_CHLD:
+            log_msg(LOG_LEVEL_DEBUG, "Supervisor received SIGCHLD");
+            break;
+        case SIGCODE_USR1:
+            log_msg(LOG_LEVEL_INFO, "Supervisor status dump (SIGUSR1): State=%s, Active Workers=%zu",
+                    supervisor_state_str(s_state), childtab_active_count());
+            break;
+        case SIGCODE_USR2: {
+            int new_v = !log_get_verbose();
+            log_set_verbose(new_v);
+            log_msg(LOG_LEVEL_INFO, "Supervisor toggled verbose logging to %d (SIGUSR2)", new_v);
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+static void run_event_loop(void) {
+    struct pollfd fds[3];
+    fds[0].fd = selfpipe_get_read_fd();
+    fds[0].events = POLLIN;
+
+    fds[1].fd = s_fifo_fd;
+    fds[1].events = POLLIN;
+
+    fds[2].fd = s_timer_fd;
+    fds[2].events = POLLIN;
+
+    while (s_running_loop) {
+        int ret = poll(fds, 3, -1);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            log_msg(LOG_LEVEL_ERROR, "poll failed: %s", strerror(errno));
+            break;
+        }
+
+        if (fds[0].revents & POLLIN) {
+            uint8_t sig_buf[64];
+            ssize_t n = selfpipe_read_signals(sig_buf, sizeof(sig_buf));
+            for (ssize_t i = 0; i < n; i++) {
+                handle_dispatched_signal(sig_buf[i]);
+            }
+        }
+
+        if (fds[1].revents & POLLIN) {
+            char buf[64];
+            ssize_t r = read(s_fifo_fd, buf, sizeof(buf));
+            (void)r;
+        }
+
+        if (fds[2].revents & POLLIN) {
+            uint64_t exp = 0;
+            ssize_t r = read(s_timer_fd, &exp, sizeof(exp));
+            (void)r;
+        }
+
+        if (s_state == STATE_TERMINATED) {
+            s_running_loop = 0;
+        }
+    }
+}
+
 int main(int argc, char *argv[]) {
     const char *cfg_path = CONFIG_FILE_DEFAULT;
     if (argc >= 2) {
@@ -191,8 +337,22 @@ int main(int argc, char *argv[]) {
         return SIGFW_EXIT_STARTUP_ERR;
     }
 
-    log_msg(LOG_LEVEL_INFO, "Supervisor initialized successfully. Running pre-flight checks.");
-    transition(STATE_RUNNING, "startup complete");
+    /* 7. Setup Signals and Timers */
+    setup_supervisor_signals();
+    if (setup_ipc_and_timers() < 0) {
+        log_msg(LOG_LEVEL_ERROR, "Failed to setup IPC and timers");
+        cleanup_resources();
+        return SIGFW_EXIT_STARTUP_ERR;
+    }
+
+    /* 8. Spawn initial worker pool */
+    spawn_initial_pool();
+
+    log_msg(LOG_LEVEL_INFO, "Supervisor initialized successfully. Running event loop.");
+    transition(STATE_RUNNING, "initial pool ready");
+
+    /* Run main event loop */
+    run_event_loop();
 
     cleanup_resources();
     return SIGFW_EXIT_CLEAN;
