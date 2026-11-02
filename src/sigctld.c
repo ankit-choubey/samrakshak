@@ -31,6 +31,8 @@ static int s_timer_fd = -1;
 static char s_shm_name[64] = {0};
 static worker_heartbeat_t *s_heartbeats = NULL;
 static int s_running_loop = 1;
+static uint64_t s_drain_deadline_ms = 0;
+static int s_forced_shutdown = 0;
 
 static void sup_sig_handler(int sig) {
     uint8_t code = 0;
@@ -141,6 +143,24 @@ int transition(supervisor_state_t to, const char *reason) {
         statefile_write_status(STATUS_FILE_DEFAULT, s_state,
                                childtab_capacity(), childtab_get(0),
                                s_heartbeats, now_ms);
+
+        if (to == STATE_DRAINING) {
+            s_drain_deadline_ms = now_ms + ((uint64_t)s_config.shutdown_timeout_s * 1000ULL);
+            log_msg(LOG_LEVEL_INFO, "Entering DRAINING: dispatching SIGTERM to all worker process groups (deadline: %ds)",
+                    s_config.shutdown_timeout_s);
+
+            size_t cap = childtab_capacity();
+            for (size_t i = 0; i < cap; i++) {
+                child_record_t *rec = childtab_get(i);
+                if (rec != NULL && rec->pid > 0 &&
+                    (rec->state == WORKER_STATE_RUNNING || rec->state == WORKER_STATE_STOPPED)) {
+                    if (rec->state == WORKER_STATE_STOPPED) {
+                        kill(-rec->pgid, SIGCONT);
+                    }
+                    kill(-rec->pgid, SIGTERM);
+                }
+            }
+        }
     }
     return 0;
 }
@@ -279,6 +299,25 @@ static void handle_timer_tick(void) {
                     log_msg(LOG_LEVEL_INFO, "Spawning delayed restart for worker [slot:%zu]", i);
                     spawn_worker(i);
                 }
+            }
+        }
+    } else if (s_state == STATE_DRAINING) {
+        if (now_ms >= s_drain_deadline_ms) {
+            log_msg(LOG_LEVEL_WARN, "Shutdown timeout (%ds) expired: escalating to SIGKILL", s_config.shutdown_timeout_s);
+            s_forced_shutdown = 1;
+            size_t cap = childtab_capacity();
+            for (size_t i = 0; i < cap; i++) {
+                child_record_t *rec = childtab_get(i);
+                if (rec != NULL && rec->pid > 0 &&
+                    (rec->state == WORKER_STATE_RUNNING || rec->state == WORKER_STATE_STOPPED)) {
+                    log_msg(LOG_LEVEL_WARN, "Escalating SIGKILL to worker [slot:%zu, PID:%d, PGID:%d]",
+                            i, (int)rec->pid, (int)rec->pgid);
+                    kill(-rec->pgid, SIGKILL);
+                }
+            }
+            reap_children();
+            if (childtab_active_count() == 0) {
+                transition(STATE_TERMINATED, "all workers reaped on deadline escalation");
             }
         }
     }
@@ -436,5 +475,5 @@ int main(int argc, char *argv[]) {
     run_event_loop();
 
     cleanup_resources();
-    return SIGFW_EXIT_CLEAN;
+    return (s_forced_shutdown ? SIGFW_EXIT_FORCED : SIGFW_EXIT_CLEAN);
 }
