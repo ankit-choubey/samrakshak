@@ -18,6 +18,7 @@ static volatile sig_atomic_t s_term_requested = 0;
 static volatile sig_atomic_t s_tstp_received = 0;
 static volatile sig_atomic_t s_cont_received = 0;
 static volatile sig_atomic_t s_usr1_received = 0;
+static volatile sig_atomic_t s_usr2_received = 0;
 
 static int s_slot_index = -1;
 static int s_sync_fd = -1;
@@ -42,6 +43,11 @@ static void worker_cont_handler(int sig) {
 static void worker_usr1_handler(int sig) {
     (void)sig;
     s_usr1_received = 1;
+}
+
+static void worker_usr2_handler(int sig) {
+    (void)sig;
+    s_usr2_received = 1;
 }
 
 static uint64_t get_monotonic_ms(void) {
@@ -101,7 +107,7 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    /* 4. Reset signal mask and install handlers */
+    /* 4. Reset signal mask and install async-signal-safe handlers */
     sigreg_unblock_all();
 
     sigreg_install(SIGTERM, worker_term_handler, 0, NULL);
@@ -109,6 +115,7 @@ int main(int argc, char *argv[]) {
     sigreg_install(SIGTSTP, worker_tstp_handler, 0, NULL);
     sigreg_install(SIGCONT, worker_cont_handler, 0, NULL);
     sigreg_install(SIGUSR1, worker_usr1_handler, 0, NULL);
+    sigreg_install(SIGUSR2, worker_usr2_handler, 0, NULL);
     sigreg_ignore(SIGHUP);
     sigreg_ignore(SIGPIPE);
 
@@ -123,23 +130,25 @@ int main(int argc, char *argv[]) {
         s_sync_fd = -1;
     }
 
-    log_msg(LOG_LEVEL_INFO, "Worker [slot:%d] started (PID:%d, PGID:%d)",
+    log_msg(LOG_LEVEL_INFO, "Worker [slot:%d] initialized (PID:%d, PGID:%d)",
             s_slot_index, (int)getpid(), (int)getpgrp());
 
     int work_cycle = 0;
     while (!s_term_requested) {
-        /* Check if SIGTSTP was received */
+        /* Check if SIGTSTP was received: log, unmask/reset to default, raise on self */
         if (s_tstp_received) {
             s_tstp_received = 0;
             log_msg(LOG_LEVEL_INFO, "Worker [slot:%d, PID:%d] suspending on SIGTSTP",
                     s_slot_index, (int)getpid());
 
-            /* Reset SIGTSTP to default and raise it so process actually stops */
             sigreg_restore_default(SIGTSTP);
             raise(SIGTSTP);
 
-            /* Re-install SIGTSTP handler after wakeup */
+            /* Resumed after SIGCONT */
             sigreg_install(SIGTSTP, worker_tstp_handler, 0, NULL);
+            log_msg(LOG_LEVEL_INFO, "Worker [slot:%d, PID:%d] un-halted after suspension",
+                    s_slot_index, (int)getpid());
+            update_heartbeat();
         }
 
         /* Check if SIGCONT was received */
@@ -150,22 +159,31 @@ int main(int argc, char *argv[]) {
             update_heartbeat();
         }
 
-        /* Check if SIGUSR1 was received */
+        /* Check if SIGUSR1 was received (heartbeat status dump) */
         if (s_usr1_received) {
             s_usr1_received = 0;
             log_msg(LOG_LEVEL_INFO, "Worker [slot:%d, PID:%d] heartbeat info: monotonic=%lu ms",
                     s_slot_index, (int)getpid(), (unsigned long)get_monotonic_ms());
         }
 
+        /* Check if SIGUSR2 was received (toggle verbose) */
+        if (s_usr2_received) {
+            s_usr2_received = 0;
+            int new_v = !log_get_verbose();
+            log_set_verbose(new_v);
+            log_msg(LOG_LEVEL_INFO, "Worker [slot:%d, PID:%d] toggled verbose logging to %d",
+                    s_slot_index, (int)getpid(), new_v);
+        }
+
         update_heartbeat();
 
-        /* Simulated work slice: sleep 500 ms in chunks or nanosleep */
+        /* Simulated work slice: 500 ms */
         struct timespec req = { 0, 500000000L };
         nanosleep(&req, NULL);
         work_cycle++;
     }
 
-    log_msg(LOG_LEVEL_INFO, "Worker [slot:%d, PID:%d] exiting cleanly on SIGTERM",
+    log_msg(LOG_LEVEL_INFO, "Worker [slot:%d, PID:%d] graceful exit requested (SIGTERM)",
             s_slot_index, (int)getpid());
 
     if (s_heartbeats != NULL && s_slot_index >= 0 && s_slot_index < MAX_WORKERS) {
