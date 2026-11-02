@@ -1,7 +1,13 @@
 #ifndef SIGFW_SELFPIPE_H
 #define SIGFW_SELFPIPE_H
 
+#ifndef _POSIX_C_SOURCE
 #define _POSIX_C_SOURCE 200809L
+#endif
+
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 
 #include <stdint.h>
 #include <unistd.h>
