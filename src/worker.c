@@ -4,6 +4,7 @@
 #include "include/sigfw.h"
 #include "src/log.h"
 #include "src/sigreg.h"
+#include "src/shm_hb.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -96,14 +97,9 @@ int main(int argc, char *argv[]) {
 
     /* 3. Attach shared memory heartbeat if name provided */
     if (strlen(s_shm_name) > 0) {
-        int shm_fd = shm_open(s_shm_name, O_RDWR, 0600);
-        if (shm_fd >= 0) {
-            void *addr = mmap(NULL, sizeof(worker_heartbeat_t) * MAX_WORKERS,
-                              PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
-            if (addr != MAP_FAILED) {
-                s_heartbeats = (worker_heartbeat_t *)addr;
-            }
-            close(shm_fd);
+        if (shm_hb_attach(s_shm_name, &s_heartbeats) == -1) {
+            log_msg(LOG_LEVEL_WARN, "Worker [slot:%d] failed to attach shared memory %s",
+                    s_slot_index, s_shm_name);
         }
     }
 
@@ -188,7 +184,8 @@ int main(int argc, char *argv[]) {
 
     if (s_heartbeats != NULL && s_slot_index >= 0 && s_slot_index < MAX_WORKERS) {
         s_heartbeats[s_slot_index].active = 0;
-        munmap(s_heartbeats, sizeof(worker_heartbeat_t) * MAX_WORKERS);
+        shm_hb_detach(s_heartbeats);
+        s_heartbeats = NULL;
     }
 
     return 0;
