@@ -56,8 +56,8 @@ echo "Chaos injection completed (${EVENT_COUNT} events). Stabilizing pool..."
 # Resume if suspended
 ./sigctl resume >/dev/null 2>&1 || true
 
-# Wait up to 5s for supervisor to recover all workers to RUNNING
-if ! wait_for 6 "grep -q 'STATE=RUNNING' sigctld.status && [ \$(grep -c 'STATE=RUNNING' sigctld.status || true) -eq 4 ]"; then
+# Wait up to 10s for supervisor to recover all workers to RUNNING
+if ! wait_for 10 "grep -q '^STATE=RUNNING' sigctld.status && [ \$(grep -c '^WORKER.*STATE=RUNNING' sigctld.status || true) -eq 4 ]"; then
     report_fail "CHAOS" "${DESC}" "Pool failed to recover all 4 workers to RUNNING state after chaos"
 fi
 

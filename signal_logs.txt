@@ -1,7 +1,0 @@
-=== LINUX SIGNAL HANDLING AND PROCESS CONTROL LOGS ===
-[2026-11-02 15:14:52] Child process started and registered signal handlers
-[2026-11-02 15:14:52] Parent created child process (Parent PID: 14911, Child PID: 14912)
-[2026-11-02 15:14:52] Child process received SIGTERM - Performing cleanup
-[2026-11-02 15:14:53] Child process terminated gracefully
-[2026-11-02 15:14:53] Parent terminated child before exiting
-[2026-11-02 15:14:53] Framework exited cleanly

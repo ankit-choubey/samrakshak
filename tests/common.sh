@@ -7,6 +7,11 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOG_DIR="${ROOT_DIR}/tests/logs"
 mkdir -p "${LOG_DIR}"
 
+if [ -x "${HOME}/.local/usr/bin/valgrind" ]; then
+    export PATH="${HOME}/.local/usr/bin:${PATH}"
+    export VALGRIND_LIB="${HOME}/.local/usr/libexec/valgrind"
+fi
+
 wait_for() {
     local timeout_secs="$1"
     local condition_cmd="$2"

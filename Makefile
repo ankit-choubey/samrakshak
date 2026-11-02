@@ -4,6 +4,9 @@ LDFLAGS = -lrt
 AR = ar
 ARFLAGS = rcs
 
+export PATH := $(HOME)/.local/usr/bin:$(PATH)
+export VALGRIND_LIB := $(HOME)/.local/usr/libexec/valgrind
+
 # Source modules for static library libsigfw.a
 LIB_SRCS = src/sigreg.c \
            src/selfpipe.c \
@@ -69,8 +72,8 @@ test: all
 	fi
 
 valgrind: all
-	@echo "Running valgrind memory leak check on T12..."
-	@bash tests/test_t12.sh
+	@echo "Running valgrind memory leak check on T12 for 60 seconds..."
+	@VALGRIND_DURATION=60 bash tests/test_t12.sh
 
 chaos: all
 	@echo "Running automated chaos engineering test..."

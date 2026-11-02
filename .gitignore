@@ -18,6 +18,7 @@ signal_logs.txt
 # Test artifacts
 tests/logs/
 tests/tmp/
+vgcore.*
 
 # OS and IDE files
 .DS_Store
