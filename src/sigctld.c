@@ -315,13 +315,28 @@ static void handle_timer_tick(void) {
     clock_gettime(CLOCK_MONOTONIC, &ts);
     uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 
-    /* Check any pending restarts under exponential backoff */
+    /* Check watchdog and pending restarts only when RUNNING */
     if (s_state == STATE_RUNNING) {
         size_t cap = childtab_capacity();
+        uint64_t hb_limit_ms = (uint64_t)s_config.heartbeat_timeout_s * 1000ULL;
+
         for (size_t i = 0; i < cap; i++) {
             child_record_t *rec = childtab_get(i);
-            if (rec != NULL && rec->state == WORKER_STATE_DEAD) {
-                if (rec->next_retry_mono_ms > 0 && now_ms >= rec->next_retry_mono_ms) {
+            if (rec != NULL) {
+                /* 1. Watchdog: check heartbeat age */
+                if (rec->state == WORKER_STATE_RUNNING && s_heartbeats != NULL && s_heartbeats[i].active) {
+                    if (s_heartbeats[i].last_monotonic_ms > 0 && now_ms > s_heartbeats[i].last_monotonic_ms) {
+                        uint64_t age = now_ms - s_heartbeats[i].last_monotonic_ms;
+                        if (age > hb_limit_ms) {
+                            log_msg(LOG_LEVEL_WARN, "Watchdog: Worker [slot:%zu, PID:%d] heartbeat stale (%lums > %lums limit). Killing with SIGKILL.",
+                                    i, (int)rec->pid, (unsigned long)age, (unsigned long)hb_limit_ms);
+                            kill(-rec->pgid, SIGKILL);
+                        }
+                    }
+                }
+
+                /* 2. Check pending delayed restarts under backoff */
+                if (rec->state == WORKER_STATE_DEAD && rec->next_retry_mono_ms > 0 && now_ms >= rec->next_retry_mono_ms) {
                     rec->next_retry_mono_ms = 0;
                     log_msg(LOG_LEVEL_INFO, "Spawning delayed restart for worker [slot:%zu]", i);
                     spawn_worker(i);
