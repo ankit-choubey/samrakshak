@@ -1,0 +1,25 @@
+# Binaries and libraries
+sigctld
+worker
+sigctl
+signal_framework
+libsigfw.a
+*.a
+*.o
+*.so
+
+# Runtime and IPC files
+*.pid
+*.status
+*.fifo
+*.log
+signal_logs.txt
+
+# Test artifacts
+tests/logs/
+tests/tmp/
+
+# OS and IDE files
+.DS_Store
+.vscode/
+.idea/
