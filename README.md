@@ -1,125 +1,168 @@
-# Linux Signal Handling and Process Control Framework
+# SigCtl: Linux Signal Handling and Process Control Framework
 
-A lightweight, beginner-friendly Linux application written in C demonstrating process creation, signal registration, asynchronous signal handling, process suspension/resumption, and graceful process termination using standard POSIX system calls.
-
----
-
-## 1. Project Overview
-
-This project implements a **Parent-Child Process Architecture** to demonstrate how an operating system controls process execution and asynchronous events via signals:
-
-- **Parent Process**: Forks the child, displays an interactive console menu, sends signals (`SIGINT`, `SIGUSR1`, `SIGSTOP`, `SIGCONT`, `SIGTERM`), monitors child execution states via `waitpid()`, and reaps the child on termination.
-- **Child Process**: Runs a continuous counter task, registers signal handlers with `sigaction()`, safely handles asynchronous signals using `volatile sig_atomic_t` flags, performs cleanup operations, and handles process suspension and resumption.
-- **Event Logger**: Automatically logs all process lifecycle events, signals sent, signals handled, state transitions, and termination timestamps to `signal_logs.txt`.
+A robust, production-grade Linux process supervisor written in C11 demonstrating strict POSIX asynchronous signal handling, self-pipe multiplexing, multi-worker process group control, heartbeats via shared memory, and automated recovery.
 
 ---
 
-## 2. Project Structure
+## 1. System Architecture
+
+SigCtl separates concerns into three distinct executables and one reusable static library:
 
 ```
-Linux-Signal-Framework/
-|-- main.c              # Complete C source code
-|-- Makefile            # Build configuration (make, make run, make clean)
-|-- signal_logs.txt     # Log file recording all runtime signal events
-|-- README.md           # Project documentation and guide
+                            +--------------------------+
+                            |       Operator CLI       |
+                            |        (./sigctl)        |
+                            +------------+-------------+
+                                         |
+                       POSIX Signals     |   Command FIFO
+                       (kill / signals)  |   (sigctl.fifo)
+                                         v
+                            +--------------------------+
+                            |    Supervisor Daemon     |
+                            |       (./sigctld)        |
+                            +------------+-------------+
+                                         |
+                   Process Groups        |   Anonymous Shared Memory
+                   kill(-pgid, sig)      |   (worker heartbeats)
+                                         v
+         +-------------------------------+-------------------------------+
+         |                               |                               |
+         v                               v                               v
++-----------------+             +-----------------+             +-----------------+
+| Worker Slot 0   |             | Worker Slot 1   |             | Worker Slot N   |
+| (./worker)      |             | (./worker)      |             | (./worker)      |
++-----------------+             +-----------------+             +-----------------+
 ```
 
----
-
-## 3. POSIX Signals Implemented
-
-| Signal | Number | Purpose | Handled By | Action Taken |
-| :--- | :--- | :--- | :--- | :--- |
-| **`SIGINT`** | 2 | Interrupt Signal | Child (`sigaction`) | Caught asynchronously; prints message and counter value without terminating. |
-| **`SIGUSR1`** | 10 | User-Defined Signal 1 | Child (`sigaction`) | Custom user signal; logs and acknowledges receipt. |
-| **`SIGSTOP`** | 19 | Process Suspension | Linux Kernel (Uncatchable) | Immediately halts child execution; verified by parent using `WIFSTOPPED`. |
-| **`SIGCONT`** | 18 | Process Resumption | Linux Kernel (Uncatchable) | Resumes suspended child; verified by parent using `WIFCONTINUED`. |
-| **`SIGTERM`** | 15 | Graceful Termination | Child (`sigaction`) | Triggers simulated cleanup (releasing resources) and calls `exit(0)`. |
-
-> **Note on Async-Signal-Safety**: In adherence to POSIX safety standards, signal handlers in this project do not perform unsafe I/O operations (like `printf` or `fopen`). Instead, handlers set small `volatile sig_atomic_t` flags, which the child process checks and acts upon safely in its primary loop.
+### Modules in `libsigfw.a`
+- `sigreg`: Type-safe wrappers for `sigaction()` and `sigprocmask()` with strict POSIX compliance.
+- `selfpipe`: Non-blocking pipe (`pipe2`) for moving asynchronous signal events safely into the main loop.
+- `childtab`: Fixed-size worker table with PID/PGID tracking, lifecycle states, and exponential backoff restart records.
+- `log`: Monotonic (`CLOCK_MONOTONIC`) elapsed time + wall-clock structured logging with PID on every line.
+- `statefile`: Atomic status file writer (`sigctld.status`) using temporary file write and `rename()`.
+- `config`: Key-value configuration parser (`sigctl.conf`) with strict validation.
+- `shm_hb`: Shared memory heartbeat segment (`/sigctl_hb_<pid>`) with lock-free timestamp synchronization.
 
 ---
 
-## 4. POSIX System Calls Used
+## 2. State Machine
 
-1. **`fork()`**: Creates a duplicate child process. Returns `0` to child and child PID to parent.
-2. **`getpid()` / `getppid()`**: Retrieves the current process ID and parent process ID.
-3. **`sigaction()`**: Registers custom signal handling dispositions with flags and signal masks.
-4. **`kill(pid, sig)`**: Dispatches POSIX signals from parent to child.
-5. **`waitpid(pid, status, options)`**: Monitors state transitions of child without blocking (`WNOHANG | WUNTRACED | WCONTINUED`).
-6. **`sleep()` / `usleep()`**: Pauses execution; interrupted immediately upon signal arrival (`EINTR`).
+The supervisor implements a 4-state state machine validated by `is_valid_transition()`:
+
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING: Startup & initial pool ready
+    RUNNING --> SUSPENDED: SIGTSTP / sigctl pause
+    SUSPENDED --> RUNNING: SIGCONT / sigctl resume
+    RUNNING --> DRAINING: SIGINT / SIGTERM / sigctl stop
+    SUSPENDED --> DRAINING: SIGINT / SIGTERM / sigctl stop
+    DRAINING --> TERMINATED: All children reaped (clean exit or SIGKILL escalation)
+    TERMINATED --> [*]: Resources released
+```
+
+- **RUNNING**: Workers execute work cycles. Watchdog actively monitors heartbeats. Unexpected crashes are restarted using exponential backoff (100ms -> 200ms -> 400ms -> 800ms -> 1600ms -> 2000ms max).
+- **SUSPENDED**: Workers suspended via `kill(-pgid, SIGTSTP)`. Watchdog checks are suspended so stopped workers are not flagged as hung. CLI commands remain responsive.
+- **DRAINING**: Graceful termination sequence started. Restarts are disabled. `SIGTERM` sent to all worker groups. If workers fail to exit within `shutdown_timeout_s`, supervisor escalates to `kill(-pgid, SIGKILL)`.
+- **TERMINATED**: All children reaped, PID lock released, temporary IPC files cleaned, supervisor exits cleanly (Exit code 0, or 3 if forced kill was required).
 
 ---
 
-## 5. Compilation and Execution
+## 3. POSIX Signal Map
 
-### Compilation
-Compile using `make` (recommended) or `gcc` on any Linux/Ubuntu or POSIX-compliant system:
+| Signal | Source | Supervisor Action | Worker Action |
+|---|---|---|---|
+| **`SIGINT`** | Ctrl+C | Enters `DRAINING`; forwards graceful shutdown to worker groups | Default action |
+| **`SIGTERM`** | `kill`, `./sigctl stop` | Enters `DRAINING`; forwards graceful shutdown to worker groups | Flushes state, logs exit, terminates `exit(0)` |
+| **`SIGHUP`** | `kill -HUP`, `./sigctl reload` | Reloads `sigctl.conf`, dynamically scales pool up or down | Ignored |
+| **`SIGCHLD`** | Linux Kernel | Self-pipe wake-up; `waitpid(-1, WNOHANG)` reaps all dead workers | None |
+| **`SIGTSTP`** | Ctrl+Z, `./sigctl pause` | Enters `SUSPENDED`; sends `SIGTSTP` to worker process groups | Logs suspension, resets to `SIG_DFL`, raises `SIGTSTP` on self |
+| **`SIGCONT`** | `./sigctl resume` | Enters `RUNNING`; sends `SIGCONT` to worker process groups | Resumes loop, logs resumption, reinstalls handler |
+| **`SIGUSR1`** | Operator / CLI | Dumps supervisor state and worker count to log | Dumps worker heartbeat info to log |
+| **`SIGUSR2`** | Operator / CLI | Toggles verbose (`DEBUG`) logging level | Toggles verbose (`DEBUG`) logging level |
+| **`SIGPIPE`** | Linux Kernel | Ignored (`SIG_IGN`) | Ignored (`SIG_IGN`) |
+
+---
+
+## 4. Compilation & Build Targets
+
+Compiled with strict flags (`-std=c11 -Wall -Wextra -Werror -pedantic`) with zero warnings:
+
 ```bash
-# Using Makefile
+# Build all binaries and libsigfw.a
 make
 
-# Or using gcc directly
-gcc -Wall -Wextra main.c -o signal_framework
+# Run the complete automated test suite (T1 - T15)
+make test
+
+# Run automated chaos engineering test (random signals and worker kills)
+make chaos
+
+# Build with AddressSanitizer and UndefinedBehaviorSanitizer
+make asan
+
+# Clean all binaries and build artifacts
+make clean
 ```
 
-### Execution
-Run the compiled executable directly or via `make`:
+---
+
+## 5. Runtime Control (`sigctl` CLI)
+
+Run `./sigctld` in one terminal:
 ```bash
-./signal_framework
+./sigctld
+```
 
-# Or:
-make run
+Control the running framework from another terminal using `./sigctl`:
+
+```bash
+# Display live supervisor state and worker table
+./sigctl status
+
+# Display raw status formatted in JSON
+./sigctl status --json
+
+# Pause all workers
+./sigctl pause
+
+# Resume all workers
+./sigctl resume
+
+# Reload configuration and dynamically resize pool
+./sigctl reload
+
+# Gracefully terminate the entire framework
+./sigctl stop
 ```
 
 ---
 
-## 6. Menu Options
+## 6. Automated Test Suite (100% Passing)
 
-```
-=============================================
-  LINUX SIGNAL HANDLING AND PROCESS CONTROL
-=============================================
-Parent PID: [PID] | Child PID: [PID] | Child Status: [RUNNING/STOPPED/TERMINATED]
----------------------------------------------
-1. Display Process Information
-2. Send SIGINT
-3. Send SIGUSR1
-4. Suspend Child Process (SIGSTOP)
-5. Resume Child Process (SIGCONT)
-6. Gracefully Terminate (SIGTERM)
-7. View Signal Event Logs
-8. Exit
----------------------------------------------
-```
-
----
-
-## 7. Step-by-Step Demonstration Workflow
-
-Follow these steps during testing or lab evaluation:
-
-1. **Launch Framework**: Run `./signal_framework`. Notice parent and child PIDs displayed, child counter starts (`1, 2, 3...`).
-2. **Send SIGUSR1 (Option 3)**: Dispatches user-defined signal. Child prints `Handled SIGUSR1!`.
-3. **Send SIGINT (Option 2)**: Dispatches interrupt signal. Child prints `Handled SIGINT!` and continues running.
-4. **Suspend Child Process (Option 4)**: Sends `SIGSTOP`. Notice child counter stops printing immediately.
-5. **Verify Stopped State (Option 1)**: Select option 1. Status displays `Child Process State: STOPPED`.
-6. **Resume Child Process (Option 5)**: Sends `SIGCONT`. Notice child counter immediately resumes incrementing.
-7. **Gracefully Terminate Child (Option 6)**: Sends `SIGTERM`. Child performs cleanup routine and exits cleanly. Parent reaps child using `waitpid()`.
-8. **Verify Terminated State (Option 1)**: Select option 1. Status displays `Child Process State: TERMINATED`. Attempting to send further signals displays a safe error message.
-9. **View Logs (Option 7)**: Displays all recorded events with timestamps from `signal_logs.txt`.
-10. **Exit (Option 8)**: Cleans up active child (if any) and exits parent cleanly.
+| Test ID | Scenario | Verification Method | Status |
+|---|---|---|---|
+| **T1** | Startup | Spawns configured worker count, status file reports `STATE=RUNNING` | ✅ PASS |
+| **T2** | Crash Recovery | `kill -9` worker; supervisor detects exit and spawns replacement | ✅ PASS |
+| **T3** | Zombie Prevention | Burst worker kills; verifies zero zombie (`<defunct>`) processes | ✅ PASS |
+| **T4** | Pool Suspension | `./sigctl pause` suspends pool, status transitions to `SUSPENDED` | ✅ PASS |
+| **T5** | Pool Resumption | `./sigctl resume` restores pool, status transitions to `RUNNING` | ✅ PASS |
+| **T6** | Double Pause Guard | Duplicate pause commands are idempotent and safely logged | ✅ PASS |
+| **T7** | Graceful Teardown | `./sigctl stop` initiates drain, reaps all children, exits code 0 | ✅ PASS |
+| **T8** | Forced Escalation | Worker traps `SIGTERM`; supervisor escalates to `SIGKILL`, exits 3 | ✅ PASS |
+| **T9** | Dynamic Pool Rescaling | Edit `worker_count` in config + reload; pool scales up and down | ✅ PASS |
+| **T10** | Signal Burst (50x) | Rapid burst of 50 `SIGUSR1`; supervisor remains 100% responsive | ✅ PASS |
+| **T11** | Watchdog Recovery | Freeze worker heartbeat; watchdog detects hung worker and restarts it | ✅ PASS |
+| **T12** | Memory Verification | Stress test under continuous commands; zero memory leaks | ✅ PASS |
+| **T13** | Signal Burst (200x) | High-load flood of 200 signals; zero lost child reaps | ✅ PASS |
+| **T14** | Ctrl+C Forwarding | `SIGINT` to supervisor alone forwards clean shutdown to all workers | ✅ PASS |
+| **T15** | Orphan Prevention | `kill -9` supervisor; workers exit via `PR_SET_PDEATHSIG` within 2s | ✅ PASS |
+| **CHAOS** | Chaos Engineering | 32+ random signal/kill/pause/resume events; pool fully recovers | ✅ PASS |
 
 ---
 
-## 8. Common Errors and Solutions
-
-- **Error: `kill failed: No such process`**
-  - *Cause*: Child process already exited and parent attempted to send signal.
-  - *Fix*: The framework automatically verifies status before sending signals and blocks operations on terminated processes.
-- **Zombie Process Creation**
-  - *Cause*: Child terminates but parent does not read its exit status with `wait()` / `waitpid()`.
-  - *Fix*: Framework uses `waitpid()` in non-blocking and blocking reap routines, ensuring no zombie processes remain.
-- **Orphan Process Creation**
-  - *Cause*: Parent exits while child is still active.
-  - *Fix*: Option 8 sends `SIGTERM` and reaps the child before parent process termination.
+## 7. Key Architectural Refinements
+See [`docs/DESIGN_CHANGES.md`](docs/DESIGN_CHANGES.md) for full explanations of design refinements:
+1. **Single TimerFD Multiplexing**: Replaced process-wide `alarm()` to prevent timer cancellation races.
+2. **Shared Memory Heartbeats**: Zero-overhead lock-free shared memory table replaces loose disk files.
+3. **`O_RDWR` Command FIFO**: Prevents `poll()` CPU-spinning on client disconnect.
+4. **`PR_SET_PDEATHSIG` Orphan Protection**: Guarantees children terminate if supervisor crashes.
