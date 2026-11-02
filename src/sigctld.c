@@ -23,7 +23,7 @@
 #include <poll.h>
 
 /* Supervisor Global State */
-static supervisor_state_t s_state = STATE_RUNNING;
+static supervisor_state_t s_state = (supervisor_state_t)-1;
 static config_t s_config;
 static int s_pid_lock_fd = -1;
 static int s_fifo_fd = -1;
@@ -250,6 +250,13 @@ void spawn_initial_pool(void) {
     for (size_t i = 0; i < cap; i++) {
         spawn_worker(i);
     }
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+    statefile_write_status(STATUS_FILE_DEFAULT, s_state,
+                           childtab_capacity(), childtab_get(0),
+                           s_heartbeats, now_ms);
 }
 
 static void reap_children(void) {

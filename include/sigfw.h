@@ -100,6 +100,7 @@ static inline const char *worker_state_str(worker_state_t s) {
 
 /* Validates state machine transition */
 static inline int is_valid_transition(supervisor_state_t from, supervisor_state_t to) {
+    if ((int)from == -1) return 1; /* initial state setting */
     if (from == to) return 1; /* idempotent */
     if (from == STATE_RUNNING && to == STATE_SUSPENDED) return 1;
     if (from == STATE_SUSPENDED && to == STATE_RUNNING) return 1;
