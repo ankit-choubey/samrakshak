@@ -84,6 +84,66 @@ int transition(supervisor_state_t to, const char *reason) {
     return 0;
 }
 
+int spawn_worker(size_t slot_index) {
+    if (slot_index >= childtab_capacity()) return -1;
+    child_record_t *rec = childtab_get(slot_index);
+    if (rec == NULL) return -1;
+
+    int sync_pipe[2];
+    if (pipe(sync_pipe) < 0) {
+        log_msg(LOG_LEVEL_ERROR, "Failed to create sync pipe for worker slot %zu", slot_index);
+        return -1;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        log_msg(LOG_LEVEL_ERROR, "Fork failed for worker slot %zu: %s", slot_index, strerror(errno));
+        close(sync_pipe[0]);
+        close(sync_pipe[1]);
+        return -1;
+    }
+
+    if (pid == 0) {
+        /* In Child Process */
+        close(sync_pipe[0]);
+        setpgid(0, 0);
+
+        char slot_buf[32];
+        char sync_buf[32];
+        snprintf(slot_buf, sizeof(slot_buf), "%zu", slot_index);
+        snprintf(sync_buf, sizeof(sync_buf), "%d", sync_pipe[1]);
+
+        execl("./worker", "worker", slot_buf, sync_buf, s_shm_name, (char *)NULL);
+        perror("execl ./worker failed");
+        _exit(127);
+    }
+
+    /* In Parent Supervisor */
+    setpgid(pid, pid); /* Avoid race with child setpgid */
+    close(sync_pipe[1]);
+
+    /* Wait for child to finish signal registration */
+    char ack = 0;
+    ssize_t r = read(sync_pipe[0], &ack, 1);
+    close(sync_pipe[0]);
+    (void)r;
+
+    rec->pid = pid;
+    rec->pgid = pid;
+    rec->state = WORKER_STATE_RUNNING;
+    rec->start_time = time(NULL);
+
+    log_msg(LOG_LEVEL_INFO, "Spawned worker [slot:%zu, PID:%d, PGID:%d]", slot_index, (int)pid, (int)pid);
+    return 0;
+}
+
+void spawn_initial_pool(void) {
+    size_t cap = childtab_capacity();
+    for (size_t i = 0; i < cap; i++) {
+        spawn_worker(i);
+    }
+}
+
 int main(int argc, char *argv[]) {
     const char *cfg_path = CONFIG_FILE_DEFAULT;
     if (argc >= 2) {
