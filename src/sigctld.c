@@ -131,6 +131,7 @@ int transition(supervisor_state_t to, const char *reason) {
     }
 
     if (s_state != to) {
+        supervisor_state_t old_state = s_state;
         log_msg(LOG_LEVEL_INFO, "State transition: %s -> %s (reason: %s)",
                 supervisor_state_str(s_state), supervisor_state_str(to), reason ? reason : "none");
         s_state = to;
@@ -140,11 +141,27 @@ int transition(supervisor_state_t to, const char *reason) {
         clock_gettime(CLOCK_MONOTONIC, &ts);
         uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 
-        statefile_write_status(STATUS_FILE_DEFAULT, s_state,
-                               childtab_capacity(), childtab_get(0),
-                               s_heartbeats, now_ms);
-
-        if (to == STATE_DRAINING) {
+        if (to == STATE_SUSPENDED) {
+            log_msg(LOG_LEVEL_INFO, "Entering SUSPENDED: sending SIGTSTP to all worker process groups");
+            size_t cap = childtab_capacity();
+            for (size_t i = 0; i < cap; i++) {
+                child_record_t *rec = childtab_get(i);
+                if (rec != NULL && rec->pid > 0 && rec->state == WORKER_STATE_RUNNING) {
+                    kill(-rec->pgid, SIGTSTP);
+                    rec->state = WORKER_STATE_STOPPED;
+                }
+            }
+        } else if (to == STATE_RUNNING && old_state == STATE_SUSPENDED) {
+            log_msg(LOG_LEVEL_INFO, "Resuming pool: sending SIGCONT to all stopped worker process groups");
+            size_t cap = childtab_capacity();
+            for (size_t i = 0; i < cap; i++) {
+                child_record_t *rec = childtab_get(i);
+                if (rec != NULL && rec->pid > 0 && rec->state == WORKER_STATE_STOPPED) {
+                    kill(-rec->pgid, SIGCONT);
+                    rec->state = WORKER_STATE_RUNNING;
+                }
+            }
+        } else if (to == STATE_DRAINING) {
             s_drain_deadline_ms = now_ms + ((uint64_t)s_config.shutdown_timeout_s * 1000ULL);
             log_msg(LOG_LEVEL_INFO, "Entering DRAINING: dispatching SIGTERM to all worker process groups (deadline: %ds)",
                     s_config.shutdown_timeout_s);
@@ -161,6 +178,10 @@ int transition(supervisor_state_t to, const char *reason) {
                 }
             }
         }
+
+        statefile_write_status(STATUS_FILE_DEFAULT, s_state,
+                               childtab_capacity(), childtab_get(0),
+                               s_heartbeats, now_ms);
     }
     return 0;
 }
