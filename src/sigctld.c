@@ -399,9 +399,53 @@ static void reload_configuration(void) {
         return;
     }
 
-    log_msg(LOG_LEVEL_INFO, "Configuration reloaded successfully from %s", s_cfg_path);
+    log_msg(LOG_LEVEL_INFO, "Configuration reloaded from %s (workers: %d -> %d)",
+            s_cfg_path, s_config.worker_count, new_cfg.worker_count);
+
+    if (s_state == STATE_RUNNING || s_state == STATE_SUSPENDED) {
+        if (new_cfg.worker_count > s_config.worker_count) {
+            size_t old_cap = (size_t)s_config.worker_count;
+            size_t new_cap = (size_t)new_cfg.worker_count;
+            childtab_set_capacity(new_cap);
+            log_msg(LOG_LEVEL_INFO, "Scaling UP pool from %zu to %zu workers", old_cap, new_cap);
+            for (size_t i = old_cap; i < new_cap; i++) {
+                spawn_worker(i);
+                if (s_state == STATE_SUSPENDED) {
+                    child_record_t *rec = childtab_get(i);
+                    if (rec && rec->pid > 0) {
+                        kill(-rec->pgid, SIGTSTP);
+                        rec->state = WORKER_STATE_STOPPED;
+                    }
+                }
+            }
+        } else if (new_cfg.worker_count < s_config.worker_count) {
+            size_t old_cap = (size_t)s_config.worker_count;
+            size_t new_cap = (size_t)new_cfg.worker_count;
+            log_msg(LOG_LEVEL_INFO, "Scaling DOWN pool from %zu to %zu workers (terminating slots %zu to %zu)",
+                    old_cap, new_cap, new_cap, old_cap - 1);
+            for (size_t i = new_cap; i < old_cap; i++) {
+                child_record_t *rec = childtab_get(i);
+                if (rec != NULL && rec->pid > 0 &&
+                    (rec->state == WORKER_STATE_RUNNING || rec->state == WORKER_STATE_STOPPED)) {
+                    if (rec->state == WORKER_STATE_STOPPED) {
+                        kill(-rec->pgid, SIGCONT);
+                    }
+                    kill(-rec->pgid, SIGTERM);
+                }
+            }
+            childtab_set_capacity(new_cap);
+        }
+    }
+
     s_config = new_cfg;
     log_set_verbose(s_config.verbose);
+
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    uint64_t now_ms = (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
+    statefile_write_status(STATUS_FILE_DEFAULT, s_state,
+                           childtab_capacity(), childtab_get(0),
+                           s_heartbeats, now_ms);
 }
 
 static void process_fifo_command(const char *cmd_line) {
