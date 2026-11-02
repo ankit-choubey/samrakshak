@@ -13,6 +13,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <stddef.h>
+#include <stdint.h>
 
 typedef struct {
     pid_t pid;
@@ -31,10 +32,14 @@ typedef struct {
 
 void childtab_init(size_t capacity);
 size_t childtab_capacity(void);
+void childtab_set_capacity(size_t new_cap);
 size_t childtab_active_count(void);
 child_record_t *childtab_get(size_t index);
 child_record_t *childtab_find_by_pid(pid_t pid);
 child_record_t *childtab_alloc_slot(void);
 void childtab_free_slot(size_t index);
+int childtab_set_state(pid_t pid, worker_state_t new_state);
+int childtab_record_exit(pid_t pid, int status);
+int childtab_record_restart(size_t index, uint64_t now_mono_ms, int max_restarts);
 
 #endif /* SIGFW_CHILDTAB_H */
