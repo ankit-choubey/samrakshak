@@ -72,6 +72,10 @@ valgrind: all
 	@echo "Running valgrind memory leak check on T12..."
 	@bash tests/test_t12.sh
 
+chaos: all
+	@echo "Running automated chaos engineering test..."
+	@bash tests/chaos.sh
+
 clean:
 	rm -f src/*.o *.o $(STATIC_LIB) $(BINARIES)
 	rm -rf tests/tmp/ tests/logs/*.log
