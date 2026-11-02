@@ -33,6 +33,12 @@ static worker_heartbeat_t *s_heartbeats = NULL;
 static int s_running_loop = 1;
 static uint64_t s_drain_deadline_ms = 0;
 static int s_forced_shutdown = 0;
+static const char *s_cfg_path = CONFIG_FILE_DEFAULT;
+
+static char s_fifo_buf[512] = {0};
+static size_t s_fifo_buf_len = 0;
+
+static void reload_configuration(void);
 
 static void sup_sig_handler(int sig) {
     uint8_t code = 0;
@@ -365,7 +371,8 @@ static void handle_dispatched_signal(uint8_t sigcode) {
             }
             break;
         case SIGCODE_HUP:
-            log_msg(LOG_LEVEL_INFO, "Supervisor received SIGHUP, reload flag set");
+            log_msg(LOG_LEVEL_INFO, "Supervisor received SIGHUP, reloading configuration");
+            reload_configuration();
             break;
         case SIGCODE_CHLD:
             reap_children();
@@ -382,6 +389,84 @@ static void handle_dispatched_signal(uint8_t sigcode) {
         }
         default:
             break;
+    }
+}
+
+static void reload_configuration(void) {
+    config_t new_cfg = s_config;
+    if (config_load(s_cfg_path, &new_cfg) != 0) {
+        log_msg(LOG_LEVEL_ERROR, "Failed to reload config from %s: keeping existing configuration", s_cfg_path);
+        return;
+    }
+
+    log_msg(LOG_LEVEL_INFO, "Configuration reloaded successfully from %s", s_cfg_path);
+    s_config = new_cfg;
+    log_set_verbose(s_config.verbose);
+}
+
+static void process_fifo_command(const char *cmd_line) {
+    char cmd[64] = {0};
+    char arg[256] = {0};
+    if (sscanf(cmd_line, "%63s %255s", cmd, arg) < 1) {
+        return;
+    }
+
+    if (strcmp(cmd, "status") == 0) {
+        log_msg(LOG_LEVEL_INFO, "FIFO command: status (reply fifo: %s)", arg);
+        if (strlen(arg) > 0) {
+            int reply_fd = open(arg, O_WRONLY | O_NONBLOCK);
+            if (reply_fd >= 0) {
+                char status_buf[2048];
+                if (statefile_read_status(STATUS_FILE_DEFAULT, status_buf, sizeof(status_buf)) == 0) {
+                    ssize_t w = write(reply_fd, status_buf, strlen(status_buf));
+                    (void)w;
+                } else {
+                    const char *err = "ERROR: Failed to read status file\n";
+                    ssize_t w = write(reply_fd, err, strlen(err));
+                    (void)w;
+                }
+                close(reply_fd);
+            } else {
+                log_msg(LOG_LEVEL_WARN, "Failed to open reply FIFO %s: %s", arg, strerror(errno));
+            }
+        }
+    } else if (strcmp(cmd, "pause") == 0) {
+        log_msg(LOG_LEVEL_INFO, "FIFO command: pause");
+        transition(STATE_SUSPENDED, "FIFO pause command");
+    } else if (strcmp(cmd, "resume") == 0) {
+        log_msg(LOG_LEVEL_INFO, "FIFO command: resume");
+        transition(STATE_RUNNING, "FIFO resume command");
+    } else if (strcmp(cmd, "reload") == 0) {
+        log_msg(LOG_LEVEL_INFO, "FIFO command: reload");
+        reload_configuration();
+    } else if (strcmp(cmd, "stop") == 0) {
+        log_msg(LOG_LEVEL_INFO, "FIFO command: stop");
+        transition(STATE_DRAINING, "FIFO stop command");
+    } else {
+        log_msg(LOG_LEVEL_WARN, "Unknown FIFO command: '%s'", cmd_line);
+    }
+}
+
+static void handle_fifo_commands(void) {
+    char read_buf[256];
+    ssize_t n = read(s_fifo_fd, read_buf, sizeof(read_buf) - 1);
+    if (n <= 0) return;
+
+    for (ssize_t i = 0; i < n; i++) {
+        char ch = read_buf[i];
+        if (ch == '\n' || ch == '\r') {
+            if (s_fifo_buf_len > 0) {
+                s_fifo_buf[s_fifo_buf_len] = '\0';
+                process_fifo_command(s_fifo_buf);
+                s_fifo_buf_len = 0;
+            }
+        } else {
+            if (s_fifo_buf_len < sizeof(s_fifo_buf) - 1) {
+                s_fifo_buf[s_fifo_buf_len++] = ch;
+            } else {
+                s_fifo_buf_len = 0;
+            }
+        }
     }
 }
 
@@ -413,9 +498,7 @@ static void run_event_loop(void) {
         }
 
         if (fds[1].revents & POLLIN) {
-            char buf[64];
-            ssize_t r = read(s_fifo_fd, buf, sizeof(buf));
-            (void)r;
+            handle_fifo_commands();
         }
 
         if (fds[2].revents & POLLIN) {
@@ -432,9 +515,8 @@ static void run_event_loop(void) {
 }
 
 int main(int argc, char *argv[]) {
-    const char *cfg_path = CONFIG_FILE_DEFAULT;
     if (argc >= 2) {
-        cfg_path = argv[1];
+        s_cfg_path = argv[1];
     }
 
     /* 1. Initialize Logging */
@@ -443,12 +525,12 @@ int main(int argc, char *argv[]) {
 
     /* 2. Load Configuration */
     config_set_defaults(&s_config);
-    if (config_load(cfg_path, &s_config) == 0) {
+    if (config_load(s_cfg_path, &s_config) == 0) {
         log_msg(LOG_LEVEL_INFO, "Loaded config from %s: workers=%d shutdown_timeout=%ds hb_timeout=%ds max_restarts=%d verbose=%d",
-                cfg_path, s_config.worker_count, s_config.shutdown_timeout_s,
+                s_cfg_path, s_config.worker_count, s_config.shutdown_timeout_s,
                 s_config.heartbeat_timeout_s, s_config.max_restarts, s_config.verbose);
     } else {
-        log_msg(LOG_LEVEL_WARN, "Config load failed or not found for %s, using defaults", cfg_path);
+        log_msg(LOG_LEVEL_WARN, "Config load failed or not found for %s, using defaults", s_cfg_path);
     }
     log_set_verbose(s_config.verbose);
 
