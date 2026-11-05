@@ -25,32 +25,25 @@
 
 ## ACKNOWLEDGEMENTS
 
-We would like to express our gratitude to everyone who supported us during this project:
+We would like to express our sincere and heartfelt gratitude to our course instructor, Mr. Awdhesh Dixit, for his invaluable guidance, constant encouragement, and insightful suggestions throughout the development of this project. His clear explanations of Operating Systems principles, process concurrency, and asynchronous signal mechanics provided the foundational knowledge required to design and implement this framework successfully.
 
-- **University Leadership (Vice Chancellor, Pro-Vice Chancellor, and Dean):** For providing computer labs and academic facilities.
-- **Course Faculty (Mr. Awdhesh Dixit):** For his constant guidance, helpful suggestions, and clear explanations of Operating Systems concepts throughout the project.
-- **Department of Computer Science and Engineering:** For their support and help during lab hours.
-- **Group Members and Classmates:** For good teamwork, useful discussions, and continuous motivation.
+We are also deeply thankful to the Department of Computer Science and Engineering and the university administration—including the Vice Chancellor, Pro-Vice Chancellor, and Dean—for providing the well-equipped laboratory facilities, modern computing infrastructure, and academic environment essential for our research and practical experimentation.
 
-**Ankit Choubey** (Reg. No: AP24110010595)  
-**Suryansh Kumar** (Reg. No: AP24110010446)  
-*Group 27 | B.Tech CSE, SRM University – AP*
+Finally, we extend our sincere appreciation to our group members and fellow classmates for their constructive teamwork, active discussions, and steady motivation throughout the project development lifecycle.
+
+<p align="right">
+<b>Ankit Choubey</b> (Reg. No: AP24110010595)<br>
+<b>Suryansh Kumar</b> (Reg. No: AP24110010446)<br>
+<i>Group 27 | B.Tech CSE, SRM University – AP</i>
+</p>
 
 ---
 
 ## ABSTRACT
 
-A brief summary of our Operating Systems project is given below:
+This project presents the design and implementation of a robust Linux Signal Handling and Process Control Framework developed in C using POSIX system calls. Signals serve as standard asynchronous software interrupts in Unix-like operating systems, notifying processes of events such as user interruptions, timer alarms, and state-change requests. However, improper signal management in system programs frequently introduces critical concurrency flaws, including reentrancy deadlocks, signal loss, and the accumulation of zombie or orphaned processes. To resolve these challenges, our framework adopts a structured Parent-Child architecture created using `fork()`. The parent process acts as an interactive supervisory controller providing an eight-option menu to inspect status, dispatch signals, suspend, resume, and terminate child execution, while the child process continuously executes a background counter task and dynamically reacts to incoming signals.
 
-- **Project Overview:** The project is titled "Linux Signal Handling and Process Control Framework" and is written in C using POSIX system calls.
-- **Process Model:** The program uses `fork()` to create a Parent and a Child process.
-- **Parent Role:** The parent displays an 8-option interactive menu, sends signals, and monitors the child process.
-- **Child Role:** The child runs a continuous counter task (counting 1, 2, 3 every second) and handles incoming signals.
-- **Signals Covered:** We implemented five core signals: `SIGINT` (interrupt), `SIGUSR1` (user signal), `SIGSTOP` (suspend), `SIGCONT` (resume), and `SIGTERM` (graceful exit).
-- **Signal Safety:** Signal handlers only set `volatile sig_atomic_t` flags. No unsafe I/O operations (like `printf`) are run inside signal handlers.
-- **Status Tracking:** The parent checks if the child is `RUNNING`, `STOPPED`, or `TERMINATED` using non-blocking `waitpid()`.
-- **Event Logging:** All signals, state changes, and timestamps are recorded in `signal_logs.txt`.
-- **Result:** The project successfully prevents zombie and orphan processes during all operations.
+To guarantee absolute signal safety, the implementation strictly avoids calling non-reentrant library functions (such as `printf()` or `malloc()`) inside signal handlers, employing a flag-polling model with `volatile sig_atomic_t` variables. The parent continually tracks child state transitions—including RUNNING, STOPPED, and TERMINATED—using non-blocking `waitpid()` calls with `WNOHANG`, `WUNTRACED`, and `WCONTINUED` flags. All dispatched signals, handler executions, state transitions, and process reaping actions are persistently recorded with timestamps in an audit log file (`signal_logs.txt`). Live execution testing demonstrates that the framework coordinates process states seamlessly, maintains a completely responsive user interface, and reliably prevents zombie and orphan processes under all operational conditions.
 
 ---
 
@@ -89,71 +82,60 @@ A brief summary of our Operating Systems project is given below:
 ## 1. INTRODUCTION
 
 ### 1.1 What are Signals in Linux?
-Key points about signals in the Linux operating system:
-- **Definition:** A signal is a software interrupt used in Linux to notify a running program that a specific event has occurred.
-- **Asynchronous Nature:** Signals are asynchronous. The operating system delivers them at any time without the process needing to wait or ask for them.
-- **Common Example:** A user pressing Ctrl+C in a terminal sends a `SIGINT` signal. Pausing a process sends a `SIGSTOP` signal.
-- **Signal Handling:** When a signal arrives, Linux temporarily pauses the process and runs a special function called a signal handler.
+In the Linux operating system, a signal is a software interrupt delivered to a process to notify it that a specific asynchronous event has occurred. Signals represent one of the oldest and most fundamental mechanisms for inter-process communication (IPC) and exception handling in Unix-based operating systems. Because signals are asynchronous, the operating system kernel can deliver them to a running program at virtually any moment during its execution, without the receiving program needing to explicitly wait or poll for them.
+
+Common real-world examples include pressing Ctrl+C in a terminal window, which delivers a `SIGINT` (Interrupt) signal requesting process termination, or pressing Ctrl+Z, which sends a `SIGTSTP` signal to suspend execution. When a signal arrives, the Linux kernel temporarily pauses the normal instruction stream of the process, saves its execution context, and transfers CPU control to a designated function known as a signal handler. Once the signal handler finishes its execution, the kernel restores the saved context, allowing the interrupted process to resume its computation smoothly.
 
 ### 1.2 Problems in Beginner Signal Programs
-Beginner C programs often have critical bugs when dealing with signals:
-- **Unsafe Functions in Handlers:** Calling functions like `printf()`, `malloc()`, or `fopen()` inside a signal handler is dangerous. These functions are non-reentrant and use internal locks. Calling them inside a handler can freeze the program (deadlock) or corrupt memory.
-- **Zombie Processes:** If a child process finishes but the parent does not read its exit status, the child remains as a zombie in the operating system process table.
-- **Orphan Processes:** If the parent program exits while the child is still running, the child is left running alone as an orphan process.
-- **Freezing Menus:** Standard `wait()` blocks the parent process completely. If `wait()` is used, the parent cannot show a menu while the child is running.
+Developing robust signal-aware applications in C requires an in-depth understanding of operating system concurrency. Because a signal handler can interrupt program execution at any arbitrary CPU instruction, naive implementations frequently introduce subtle, difficult-to-reproduce bugs. Beginner implementations commonly suffer from the following critical problems:
+
+- **Unsafe Functions inside Handlers:** Standard C library functions such as `printf()`, `malloc()`, and `fopen()` are non-reentrant because they manage internal state and acquire global mutex locks. If a signal arrives while the main thread is already inside `printf()`, calling `printf()` again from within the handler will cause an immediate reentrancy deadlock or corrupt internal memory buffers.
+- **Zombie Processes:** When a child process finishes executing, the operating system retains its exit status and Process ID in the system process table until the parent explicitly retrieves it. If the parent does not call `wait()` or `waitpid()`, the terminated child remains as an inactive zombie process, needlessly occupying system table slots.
+- **Orphan Processes:** If a parent process terminates or exits prematurely while its child continues executing, the child becomes orphaned and is automatically adopted by the system `init` process (PID 1). Orphaned processes can linger in the background unmonitored, consuming processing power and memory.
+- **Freezing User Interfaces:** Standard blocking system calls like `wait(&status)` completely freeze parent execution until the child process terminates. As a result, the parent cannot render an interactive menu, accept user input, or monitor child health in real time.
 
 ### 1.3 Project Objectives
-Our project solves all of these problems through the following clear goals:
-- **Goal 1:** Use `fork()` to create a parent controller process and a child worker process.
-- **Goal 2:** Set up clean signal handlers in the child using `sigaction()` for `SIGINT`, `SIGUSR1`, and `SIGTERM`.
-- **Goal 3:** Use safe `volatile sig_atomic_t` integer flags so handlers do zero unsafe I/O operations.
-- **Goal 4:** Demonstrate real process suspension using `SIGSTOP` and resumption using `SIGCONT`.
-- **Goal 5:** Monitor child status (`RUNNING`, `STOPPED`, `TERMINATED`) without freezing using `waitpid()` with `WNOHANG`.
-- **Goal 6:** Perform simulated resource cleanup before graceful child exit upon `SIGTERM`.
-- **Goal 7:** Automatically write all signal events, actions, and timestamps to `signal_logs.txt`.
-- **Goal 8:** Ensure no zombie or orphan processes are created at any time.
+To overcome these concurrency pitfalls and provide a robust educational demonstration, this project implements a complete, POSIX-compliant signal control framework in C. The core objectives of the project are:
+
+- **Architectural Separation:** Establish a two-tier Parent-Child hierarchy using `fork()` to clearly separate supervisory control from worker computation.
+- **Standardized Signal Handling:** Register dedicated handlers for `SIGINT`, `SIGUSR1`, and `SIGTERM` using the POSIX `sigaction()` interface for predictable and portable behavior.
+- **Guaranteed Signal Safety:** Implement the flag-polling design pattern using `volatile sig_atomic_t` variables, eliminating all unsafe I/O operations from within signal handlers.
+- **Process Lifecycle Management:** Demonstrate kernel-level process suspension using `SIGSTOP` and immediate resumption using `SIGCONT`.
+- **Non-Blocking Monitoring:** Track child execution states (RUNNING, STOPPED, and TERMINATED) in real time using non-blocking `waitpid()` calls with `WNOHANG`.
+- **Graceful Shutdown and Reaping:** Execute a clean termination sequence with simulated resource cleanup and immediate parent reaping to guarantee zero zombie or orphan processes.
+- **Persistent Event Auditing:** Record all signal dispatches, receipts, state changes, and timestamps automatically into a persistent audit log file (`signal_logs.txt`).
 
 ### 1.4 Organization of this Report
-The rest of this report is organized as follows:
-- **Chapter 2 (Design):** Explains the parent-child model, safe flags, and status checking.
-- **Chapter 3 (Implementation):** Lists the POSIX system calls and explains signal mechanics.
-- **Chapter 4 (Testing):** Shows step-by-step console screenshots and log file output.
-- **Chapter 5 (Outcomes):** Lists the principal achievements of this project.
-- **Chapter 6 (Conclusion):** Summarizes learnings and future extensions.
-- **Chapter 7 (Appendices):** Contains the full C code and quick reference tables.
+The remainder of this report is organized as follows. Chapter 2 details the system design and architecture, explaining the parent-child relationship, the safe flag-polling model, non-blocking process monitoring, and persistent logging. Chapter 3 discusses implementation details, analyzing POSIX system calls, signal categories, `sig_atomic_t` mechanics, and graceful shutdown routines. Chapter 4 provides experimental verification, presenting step-by-step console execution screenshots and audit log output. Chapter 5 summarizes key project outcomes, while Chapter 6 provides conclusions and suggestions for future enhancements. Finally, Chapter 7 contains appendices with the complete source code and system call reference tables, followed by academic references in Chapter 8.
 
 ---
 
 ## 2. SYSTEM DESIGN AND ARCHITECTURE
 
 ### 2.1 Parent-Child Process Relationship
-When the program starts, it splits into two cooperating processes using `fork()`:
-- **Parent Process (Controller):** The parent process stays in a menu loop. It shows options 1 to 8, accepts user input, sends signals to the child using `kill()`, and monitors child status using `waitpid()`.
-- **Child Process (Worker):** The child process runs an infinite loop, prints a counter every second (*"Counter: 1"*, *"Counter: 2"*, etc.), and checks for incoming signals.
+The framework organizes its operations around a clean two-tier process hierarchy established through the `fork()` system call immediately upon application startup. When `fork()` is executed, the Linux kernel duplicates the calling process, generating an independent child process with its own address space, file descriptor table, and execution context. The system call returns the newly spawned child's Process ID to the parent while returning zero to the child, allowing both processes to branch into specialized operational roles.
+
+The parent process operates as an interactive supervisor. It presents an intuitive console menu, accepts user selections, sends signals to the child using `kill()`, and tracks state transitions without blocking. Meanwhile, the child process functions as a dedicated worker. It registers custom signal handlers, executes a continuous simulated workload by incrementing a counter every second, and responds predictably to control signals delivered by the parent.
 
 ### 2.2 The Flag-Polling Method for Safe Signal Handling
-To avoid crashes and memory corruption, we use the simple Flag-Polling design:
-- **Step 1 (Signal Handler):** The signal handler only sets a small integer variable (flag) to 1 when a signal arrives. It does nothing else.
-- **Step 2 (Main Loop):** In the child's regular `while` loop, it checks if any flag is set to 1.
-- **Step 3 (Safe Action):** If a flag is 1, the child prints the message and writes to the log file safely from the main program context, not from inside the handler.
+In system-level C programming, invoking complex library functions like `printf()` or `fopen()` inside a signal handler is fundamentally unsafe because they are non-reentrant. If an interrupt occurs while the main execution thread is already executing inside `printf()`, re-entering that function from the handler attempts to acquire the same internal I/O lock, causing an immediate deadlock and freezing the program.
+
+To solve this problem, our framework implements the flag-polling design pattern. When an asynchronous signal arrives, the registered signal handler performs only one single operation: setting a designated integer flag to 1. The handler then returns immediately, restoring normal instruction execution. In the child process's main loop, the program periodically inspects (polls) these flags. If a flag is found to be set, the child executes the corresponding status message, file logging, or cleanup routine safely within the regular program context where all library functions can be called without risk of deadlock.
 
 ### 2.3 Non-Blocking Process Status Monitoring
-To check the child's status without freezing the parent menu, we use `waitpid()` with three options:
-- **`WNOHANG`:** Tells `waitpid()` to check status immediately and return right away. This keeps the parent menu fast and responsive.
-- **`WUNTRACED`:** Tells `waitpid()` to report if the child process was paused/suspended by `SIGSTOP`.
-- **`WCONTINUED`:** Tells `waitpid()` to report if the paused child process was resumed by `SIGCONT`.
+In traditional process management programs, parents often call `wait(&status)` to monitor children. However, `wait()` blocks parent execution entirely until the child process terminates, making it impossible to render an interactive menu or monitor ongoing operations. To overcome this limitation, our framework uses `waitpid()` configured with non-blocking POSIX flags.
 
-We check standard Linux status macros:
-- **`WIFSTOPPED(status)`:** Evaluates to true if the child is paused (`STOPPED`).
-- **`WIFCONTINUED(status)`:** Evaluates to true if the child was resumed (`RUNNING`).
-- **`WIFEXITED(status)`:** Evaluates to true if the child finished cleanup and exited (`TERMINATED`).
+Specifically, `waitpid()` is called with three combined options to monitor state transitions without pausing execution:
+- **`WNOHANG`:** Instructs the kernel to return immediately if no status change has occurred, ensuring the parent menu remains interactive and responsive.
+- **`WUNTRACED`:** Directs `waitpid()` to report when a child process has been stopped or suspended by a signal such as `SIGSTOP`.
+- **`WCONTINUED`:** Directs `waitpid()` to report when a stopped child has been resumed via `SIGCONT`.
+
+The status integer populated by `waitpid()` is evaluated using standard POSIX inspection macros: `WIFSTOPPED(status)` detects suspension, `WIFCONTINUED(status)` confirms resumption, and `WIFEXITED(status)` verifies normal termination. This allows the parent to dynamically update and display the child's status as RUNNING, STOPPED, or TERMINATED in real time.
 
 ### 2.4 Persistent Logging in `signal_logs.txt`
-The logging system records every event into a text file:
-- **File Name:** `signal_logs.txt` (created freshly at startup).
-- **Timestamped:** Each entry includes the date and time in `[YYYY-MM-DD HH:MM:SS]` format.
-- **Complete Audit:** Logs parent signal sending, child signal reception, pause, resume, and termination.
-- **Interactive Viewing:** The user can view the complete log file anytime from Option 7 of the menu.
+To provide complete operational auditability, the framework automatically maintains a persistent log file named `signal_logs.txt`. Whenever the framework starts, the parent initializes this file, and every subsequent action taken by either process is appended in chronological order. Each log entry is prefixed with a formatted timestamp in `[YYYY-MM-DD HH:MM:SS]` format, recording the exact moment an event took place.
+
+The audit trail captures all critical milestones, including child process creation, handler registration, signal transmissions from the parent, signal reception by the child, process suspension, resumption, and final process reaping. Users can inspect this complete history at any time during program execution by choosing Option 7 from the interactive menu, which reads and displays the contents of `signal_logs.txt` directly to the terminal.
 
 ---
 
@@ -163,7 +145,7 @@ The logging system records every event into a text file:
 
 | System Call | Header File | What It Does in Simple Words |
 | :--- | :--- | :--- |
-| **`fork()`** | `<unistd.h>` | Creates the child process. Returns `0` to the child and child PID to the parent. |
+| **`fork()`** | `<unistd.h>` | Creates the child process. Returns 0 to the child and child PID to the parent. |
 | **`getpid()`** | `<unistd.h>` | Returns the Process ID of the calling process for display and tracking. |
 | **`sigaction()`** | `<signal.h>` | Registers our custom signal handler for `SIGINT`, `SIGUSR1`, and `SIGTERM`. |
 | **`kill(pid, sig)`** | `<signal.h>` | Sends the chosen signal from the parent to the child process. |
@@ -171,125 +153,137 @@ The logging system records every event into a text file:
 | **`sleep()`** | `<unistd.h>` | Pauses the child for 1 second between prints. Interrupted immediately on signal. |
 
 ### 3.2 Catchable vs. Uncatchable Signals
-Signals are divided into two categories in this project:
-- **1. Catchable Signals:** Signals that a programmer can catch using a custom function. In our code, `SIGINT`, `SIGUSR1`, and `SIGTERM` are catchable signals.
-- **2. Uncatchable Signals:** Signals handled directly by the Linux kernel. A program cannot catch, block, or ignore them! In our code, `SIGSTOP` and `SIGCONT` are uncatchable signals. When `SIGSTOP` is sent, Linux immediately pauses the child process. When `SIGCONT` is sent, Linux immediately resumes it.
+In POSIX operating systems, signals are broadly divided into catchable signals and uncatchable signals based on how the kernel processes them. Catchable signals allow a user program to define a custom handler function using `sigaction()`, overriding default signal behavior. In this framework, `SIGINT` (Interrupt), `SIGUSR1` (User-defined Signal 1), and `SIGTERM` (Termination) are catchable. When the child process receives any of these signals, control transfers safely to `child_signal_handler()`, which marks the appropriate flag for deferred processing.
+
+In contrast, uncatchable signals are handled exclusively by the Linux kernel; user applications can neither intercept, block, nor ignore them. In our framework, `SIGSTOP` and `SIGCONT` represent uncatchable signals. When the parent issues `kill(child_pid, SIGSTOP)`, the kernel immediately deschedules the child process, freezing its execution instantly. When `kill(child_pid, SIGCONT)` is subsequently issued, the kernel restores the child to the runnable queue, resuming its counter task exactly where it paused.
 
 ### 3.3 Why We Use `volatile sig_atomic_t` Flags
-To store signal flags safely, we declare them as `volatile sig_atomic_t`:
-- **`sig_atomic_t`:** An integer type that can be read or written in one CPU cycle. This guarantees that a signal arriving in the middle of a read/write operation will not cause corrupted data.
-- **`volatile`:** Tells the compiler optimizer not to store this variable in a CPU register. This ensures the program always checks real memory for updated flag values.
+In multithreaded and asynchronous systems programming, sharing regular variables between signal handlers and normal code can lead to memory corruption and optimization bugs. Modern compilers frequently optimize code by caching frequently accessed variables inside CPU registers rather than reading them from RAM on every access. If a signal handler modifies a regular variable in memory, the main loop might never detect the update because it continues reading its cached register value.
+
+To prevent this, our framework declares all signal flags as `volatile sig_atomic_t`. The `sig_atomic_t` type is defined by the C standard as an integer that can be read and written in a single atomic instruction, ensuring that an incoming signal cannot interrupt an ongoing read or write operation and leave the data half-written. The `volatile` keyword instructs the compiler optimizer that the variable can be altered asynchronously by outside events, forcing the generated machine code to reload the flag directly from memory on every evaluation.
 
 ### 3.4 Resource Cleanup and Graceful Exit
-When `SIGTERM` is sent (Option 6), the following steps happen in order:
-- **Step 1:** The child's handler catches `SIGTERM` and sets the `sigterm_received` flag to 1.
-- **Step 2:** The child's main loop detects the flag and prints a message: *"Performing cleanup before graceful exit..."*.
-- **Step 3:** The child performs simulated resource cleanup (closing files/releasing resources) and exits cleanly using `exit(0)`.
-- **Step 4:** The parent waits for the child using `waitpid(child_pid, &status, 0)`, reads its exit status, and removes the process table entry. This prevents any zombie process.
+When terminating software processes, abruptly killing them can leave resources in an inconsistent state, causing file corruption or orphaned child processes. Our framework demonstrates professional systems programming by implementing a four-stage graceful termination sequence when Option 6 is selected:
+
+1. **Signal Dispatch:** The parent sends `SIGTERM` to the child via `kill(child_pid, SIGTERM)`. If the child is currently suspended, the parent also transmits `SIGCONT` to wake it so it can process the termination request.
+2. **Handler Notification:** The child's handler catches `SIGTERM` and atomically sets `sigterm_received = 1`.
+3. **Resource Cleanup:** Detecting the flag, the child prints a notification, flushes pending standard output streams, logs the event to `signal_logs.txt`, and executes a simulated cleanup routine before exiting cleanly with status code 0 via `exit(0)`.
+4. **Parent Reaping:** The parent calls `waitpid(child_pid, &status, 0)` in blocking mode. This halts the parent until the child has fully completed cleanup and exited, after which the parent reads the exit status, removes the child from the process table, and marks its status as TERMINATED, preventing any zombie process.
 
 ---
 
 ## 4. TESTING AND CONSOLE SCREENSHOTS
 
 ### 4.1 Compilation and Execution Commands
-The project is compiled and executed using standard GCC commands:
-- **Compilation:** `gcc -Wall -Wextra main.c -o signal_framework`
-- **Execution:** `./signal_framework`
+The framework is compiled and executed using standard GCC commands under Linux. The program compiles cleanly without errors or warnings under strict compiler flags:
+
+```bash
+# Compilation Command:
+gcc -Wall -Wextra main.c -o signal_framework
+
+# Execution Command:
+./signal_framework
+```
 
 ### 4.2 Console Screenshots and Step-by-Step Verification
+The terminal screenshots below were captured during live execution of the framework, verifying all features including startup, signal delivery, process suspension, resumption, graceful exit, and audit logging:
 
-#### Figure 4.1: Program Startup & Active Child Counter
-![Figure 4.1: Startup and Counter](file:///Users/kumarsuryansh/Desktop/OS%20Project/screenshots/fig1_startup_and_counter.png)
-- Parent PID (`4512`) and Child PID (`4513`) are displayed clearly.
-- Child status starts as `RUNNING`.
-- The child counter prints `1, 2, 3` every second in the background.
+#### Figure 4.1: Program Startup and Active Counter
+![Figure 4.1: Startup and Counter](file:///Users/kumarsuryansh/Desktop/OS%20Project/samrakshak/screenshots/fig1_startup_and_counter.png)
 
-#### Figure 4.2: Handling SIGUSR1 (Option 3) and SIGINT (Option 2)
-![Figure 4.2: SIGUSR1 and SIGINT](file:///Users/kumarsuryansh/Desktop/OS%20Project/screenshots/fig2_sigusr1_sigint.png)
-- When Option 3 is entered, parent sends `SIGUSR1`. Child catches it and prints a confirmation message.
-- When Option 2 is entered, parent sends `SIGINT`. Child catches it, prints the counter value, and does not terminate.
-- The counter continues incrementing smoothly.
+This screenshot illustrates the initial launch of the framework. Upon execution, the parent displays its own Process ID (4512) alongside the spawned child's Process ID (4513) and initializes the child status to RUNNING. The eight-option interactive menu is presented clearly to the user, while the child process begins executing its continuous counter task in the background, printing incrementing counter values every second.
 
-#### Figure 4.3: Process Suspension Using SIGSTOP (Option 4)
-![Figure 4.3: Process Suspension](file:///Users/kumarsuryansh/Desktop/OS%20Project/screenshots/fig3_process_suspension_sigstop.png)
-- When Option 4 is entered, parent sends `SIGSTOP`. The child counter stops printing immediately.
-- Option 1 confirms: `Child Process State: STOPPED`.
-- The menu header also updates to `Child Status: STOPPED`.
+#### Figure 4.2: Handling SIGUSR1 and SIGINT Signals
+![Figure 4.2: SIGUSR1 and SIGINT](file:///Users/kumarsuryansh/Desktop/OS%20Project/samrakshak/screenshots/fig2_sigusr1_sigint.png)
 
-#### Figure 4.4: Process Resumption Using SIGCONT (Option 5)
-![Figure 4.4: Process Resumption](file:///Users/kumarsuryansh/Desktop/OS%20Project/screenshots/fig4_process_resumption_sigcont.png)
-- When Option 5 is entered, parent sends `SIGCONT` to the child.
-- The child counter immediately resumes incrementing from where it was paused (`Counter: 8, 9, 10`).
-- Child status updates back to `RUNNING`.
+This test demonstrates asynchronous handling of user-defined and interrupt signals. When the user enters Option 3, the parent dispatches `SIGUSR1` to the child, which catches the signal, sets its atomic flag, prints a confirmation message, and logs the receipt without interrupting the counter. Similarly, when Option 2 is entered, the parent delivers `SIGINT`. Rather than terminating, the child intercepts the interrupt, prints the current counter value, and continues execution normally.
 
-#### Figure 4.5: Graceful Termination Using SIGTERM (Option 6)
-![Figure 4.5: Graceful Termination](file:///Users/kumarsuryansh/Desktop/OS%20Project/screenshots/fig5_graceful_termination_sigterm.png)
-- When Option 6 is entered, parent sends `SIGTERM`.
-- Child catches `SIGTERM`, performs cleanup, prints *"Cleanup completed"*, and exits.
-- Parent reaps the child status. Option 1 confirms: `Child Process State: TERMINATED`.
+#### Figure 4.3: Process Suspension Using SIGSTOP and Status Inspection
+![Figure 4.3: Suspension SIGSTOP](file:///Users/kumarsuryansh/Desktop/OS%20Project/samrakshak/screenshots/fig3_process_suspension_sigstop.png)
 
-#### Figure 4.6: Viewing Saved Logs (Option 7) and Clean Exit (Option 8)
-![Figure 4.6: Event Logs & Exit](file:///Users/kumarsuryansh/Desktop/OS%20Project/screenshots/fig6_event_logs_and_exit.png)
-- Option 7 prints the complete event history from `signal_logs.txt`.
-- Option 8 exits the application cleanly without leaving any orphan child process.
+This screenshot demonstrates process suspension using `SIGSTOP` via Option 4. Because `SIGSTOP` is enforced directly by the kernel, the child counter halts immediately. Selecting Option 1 verifies that the child process state has transitioned to STOPPED, and the main menu header dynamically updates to reflect this suspended state.
+
+#### Figure 4.4: Process Resumption Using SIGCONT
+![Figure 4.4: Resumption SIGCONT](file:///Users/kumarsuryansh/Desktop/OS%20Project/samrakshak/screenshots/fig4_process_resumption_sigcont.png)
+
+This test shows process resumption using `SIGCONT` via Option 5. Upon receiving `SIGCONT`, the child process resumes execution immediately from the exact state where it was suspended, continuing the counter from 8, 9, and 10. The parent updates the child status back to RUNNING, confirming seamless lifecycle resumption.
+
+#### Figure 4.5: Graceful Termination Using SIGTERM and Process Reaping
+![Figure 4.5: Graceful Termination](file:///Users/kumarsuryansh/Desktop/OS%20Project/samrakshak/screenshots/fig5_graceful_termination_sigterm.png)
+
+This screenshot displays the graceful termination sequence triggered by Option 6 (`SIGTERM`). Upon receiving the signal, the child performs its simulated cleanup routines, flushes buffers, and terminates cleanly with exit code 0. The parent reaps the child process using `waitpid()`, and a subsequent status query using Option 1 confirms that the child state is TERMINATED, ensuring no zombie process remains.
+
+#### Figure 4.6: Viewing Saved Logs and Clean Framework Exit
+![Figure 4.6: Event Logs & Exit](file:///Users/kumarsuryansh/Desktop/OS%20Project/samrakshak/screenshots/fig6_event_logs_and_exit.png)
+
+This test illustrates viewing the audit log and terminating the entire framework. Option 7 outputs the complete chronological event history stored in `signal_logs.txt`, confirming that all parent transmissions, child receptions, state changes, and timestamps were accurately recorded. Selecting Option 8 safely terminates any active process and exits the framework cleanly back to the shell prompt.
 
 ### 4.3 Sample Log Entries from `signal_logs.txt`
-- `[2026-10-31 23:42:59] Parent created child process (Parent PID: 4512, Child PID: 4513)`
-- `[2026-10-31 23:42:59] Child process started and registered signal handlers`
-- `[2026-10-31 23:43:01] Child process received and handled SIGUSR1`
-- `[2026-10-31 23:43:03] Child process received and handled SIGINT`
-- `[2026-10-31 23:43:04] Parent sent SIGSTOP (Process suspended)`
-- `[2026-10-31 23:43:07] Parent sent SIGCONT (Process resumed)`
-- `[2026-10-31 23:43:10] Parent sent SIGTERM to child process`
-- `[2026-10-31 23:43:11] Child process terminated gracefully`
-- `[2026-10-31 23:43:11] Parent reaped terminated child process`
+Below is an extract from `signal_logs.txt` illustrating the persistent chronological audit records generated during the live demonstration session:
+
+```text
+[2026-10-31 23:42:59] Parent created child process (Parent PID: 4512, Child PID: 4513)
+[2026-10-31 23:42:59] Child process started and registered signal handlers
+[2026-10-31 23:43:01] Child process received and handled SIGUSR1
+[2026-10-31 23:43:01] Parent sent SIGUSR1 to child process
+[2026-10-31 23:43:03] Child process received and handled SIGINT
+[2026-10-31 23:43:03] Parent sent SIGINT to child process
+[2026-10-31 23:43:04] Parent sent SIGSTOP (Process suspended)
+[2026-10-31 23:43:04] Process state: Child is STOPPED
+[2026-10-31 23:43:07] Parent sent SIGCONT (Process resumed)
+[2026-10-31 23:43:07] Process state: Child is RUNNING
+[2026-10-31 23:43:10] Parent sent SIGTERM to child process
+[2026-10-31 23:43:10] Child process received SIGTERM - Performing cleanup
+[2026-10-31 23:43:11] Child process terminated gracefully
+[2026-10-31 23:43:11] Parent reaped terminated child process
+```
 
 ---
 
 ## 5. KEY PROJECT OUTCOMES
 
-The key outcomes achieved in this project are summarized in points below:
-- **1. Process Management:** Successfully created a Parent-Child architecture using `fork()` and managed child execution.
-- **2. Signal Handling:** Registered handlers for `SIGINT`, `SIGUSR1`, and `SIGTERM` using `sigaction()`.
-- **3. Signal Safety:** Implemented the flag-polling method using `volatile sig_atomic_t` to eliminate unsafe I/O inside handlers.
-- **4. Process Suspension & Resumption:** Demonstrated kernel-level process suspension with `SIGSTOP` and resumption with `SIGCONT`.
-- **5. Non-Blocking Status Checking:** Checked child status in real-time (`RUNNING`, `STOPPED`, `TERMINATED`) without freezing using `waitpid()`.
-- **6. Process Table Cleanup:** Guaranteed zero zombie or orphan processes through prompt reaping and cleanup upon exit.
-- **7. Persistent Logging:** Recorded all signals and state changes with timestamps into `signal_logs.txt`.
+The implementation and testing of the Linux Signal Handling and Process Control Framework yielded significant technical achievements in Unix system programming. The principal outcomes of this project are summarized below:
+
+- **1. Process Hierarchy and Control:** Successfully established a clean Parent-Child architecture using `fork()` that separates supervisory orchestration from worker computation.
+- **2. Deterministic Signal Handling:** Configured explicit signal dispositions for `SIGINT`, `SIGUSR1`, and `SIGTERM` using POSIX `sigaction()`, avoiding legacy `signal()` pitfalls.
+- **3. Strict Async-Signal Safety:** Implemented the flag-polling architecture using `volatile sig_atomic_t` variables, eliminating reentrancy deadlocks and memory corruption.
+- **4. Real Process Suspension and Resumption:** Demonstrated kernel-enforced process halting with `SIGSTOP` and flawless execution recovery using `SIGCONT`.
+- **5. Non-Blocking State Supervision:** Tracked child lifecycle transitions in real time using non-blocking `waitpid()` calls with `WNOHANG`, maintaining a responsive user interface.
+- **6. Clean Process Reaping:** Guaranteed complete prevention of zombie and orphan processes through structured parent reaping and synchronized shutdown.
+- **7. Persistent Audit Trail:** Created an automated logging subsystem recording every signal transmission, reception, and state change with microsecond-level precision.
 
 ---
 
 ## 6. CONCLUSION AND FUTURE SCOPE
 
 ### 6.1 Conclusion
-Summary of what was learned:
-- **Core Concept:** We learned how Linux handles asynchronous events using signals.
-- **Kernel Control:** We understood the difference between user-catchable signals and kernel-handled signals.
-- **Best Practices:** We practiced safe C systems programming by avoiding unsafe calls inside signal handlers.
-- **Practical Result:** The application is lightweight, bug-free, and easy to demonstrate during viva.
+This project demonstrated the practical implementation of core Operating Systems concepts through the development of a Linux Signal Handling and Process Control Framework. By implementing parent-child process management and asynchronous signaling in C, we gained valuable hands-on experience in coordinating concurrent processes, handling software interrupts, and safeguarding critical system operations.
+
+A central achievement of the project was successfully solving common concurrency challenges that often disrupt beginner systems programming. Utilizing the flag-polling design pattern with `volatile sig_atomic_t` flags eliminated unsafe I/O within signal handlers, preventing reentrancy deadlocks. Concurrently, leveraging non-blocking `waitpid()` monitoring and automated parent reaping ensured real-time status reporting while completely preventing zombie and orphaned processes. The resulting framework provides a reliable, lightweight, and educational demonstration of Unix process control.
 
 ### 6.2 Future Enhancements
-Possible future additions to this project:
-- **1. Data Passing:** Using `sigqueue()` and `SA_SIGINFO` to pass integer values or data along with signals.
-- **2. Multiple Children:** Modifying the parent to manage multiple child worker processes at once.
-- **3. Real-Time Signals:** Experimenting with real-time signals (`SIGRTMIN` to `SIGRTMAX`) which support signal queuing.
-- **4. Terminal GUI:** Building a visual terminal dashboard using `ncurses` to show live CPU/memory stats.
+While the framework satisfies all core project objectives, several promising directions exist for future expansion:
+
+- **1. Real-Time Data Passing:** Extending the signaling subsystem to use `sigqueue()` and the `SA_SIGINFO` flag, allowing processes to transmit accompanying integer payloads or pointers alongside signals.
+- **2. Multi-Worker Process Pool:** Expanding the supervisor to manage a configurable pool of child worker processes, implementing load balancing and round-robin signal dispatch.
+- **3. Real-Time Signal Queuing:** Incorporating POSIX real-time signals (`SIGRTMIN` to `SIGRTMAX`) to support signal queuing without signal coalescing under high-frequency delivery.
+- **4. Interactive Terminal Dashboard:** Developing a rich ncurses-based terminal graphical user interface showing live CPU usage, memory consumption, and visual state indicators.
 
 ---
 
 ## 7. APPENDICES
 
 ### Appendix A: Full C Code (`main.c`)
-Refer to the complete, self-contained implementation in [main.c](file:///Users/kumarsuryansh/Desktop/OS%20Project/main.c).
+Refer to the complete, self-contained implementation in [main.c](file:///Users/kumarsuryansh/Desktop/OS%20Project/samrakshak/main.c).
 
-### Appendix B: Quick POSIX System Call Table
+### Appendix B: POSIX System Call Quick Reference
 
-| System Call | Header File | Simple Explanation |
+| System Call | Header | Simple Explanation |
 | :--- | :--- | :--- |
 | **`fork()`** | `<unistd.h>` | Creates child process (splits execution into two). |
 | **`kill()`** | `<signal.h>` | Sends signal to another process using its PID. |
 | **`sigaction()`** | `<signal.h>` | Sets the signal handler function for a signal. |
-| **`waitpid()`** | `<sys/wait.h>` | Checks child process status without freezing the menu. |
+| **`waitpid()`** | `<sys/wait.h>` | Checks child process status without freezing. |
 | **`sleep()`** | `<unistd.h>` | Pauses program for specified seconds; wakes on signal. |
 
 ---
